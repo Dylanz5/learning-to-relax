@@ -1,0 +1,22 @@
+ __pycache__/
+ *.py[cod]
+ *.so
+ .pytest_cache/
+ .mypy_cache/
+ .ruff_cache/
+ .venv/
+ venv/
+ dist/
+ build/
+ *.egg-info/
+ 
+ plots/
+ .DS_Store
+
+*.egg-info/
+*.eggs/
+
+*.pyc
+
+banditos/
+*.png
