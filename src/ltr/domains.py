@@ -52,8 +52,9 @@ def _laplacian_from_mask(mask: np.ndarray, h: float) -> tuple[sp.csr_matrix, np.
      cols: list[int] = []
      data: list[float] = []
  
-     # 5-point stencil scaled by 1/h^2
-     inv_h2 = 1.0 / (h * h)
+     # MATLAB `delsq(numgrid(...))` returns the unscaled 5-point Laplacian
+     # (diagonal 4, off-diagonal -1). Do NOT scale by 1/h^2 here.
+     inv_h2 = 1.0
  
      for (i, j) in pts:
          r = int(idx[i, j])
@@ -101,6 +102,7 @@ def delsq_numgrid(region: Region, s: int) -> Domain:
  
      # number of interior points per side
      n_int = s - 2
+     # Keep h only for coordinate reporting; matrix is unscaled to match MATLAB.
      h = 1.0 / s
  
      if region == "S":
@@ -115,7 +117,6 @@ def delsq_numgrid(region: Region, s: int) -> Domain:
          raise ValueError("region must be 'S' or 'L'")
  
      A, coords = _laplacian_from_mask(mask, h=h)
-     print("A shape:", A.shape)
 
      return Domain(region=region, s=s, A=A, coords=coords, mask=mask)
  

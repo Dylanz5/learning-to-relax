@@ -9,6 +9,7 @@ import scipy.sparse as sp
 from scipy.stats import beta as beta_dist
 
 from ltr.domains import delsq_numgrid
+from ltr.learners.exp3_spectral import Exp3Spectral, chain_laplacian
 from ltr.learners.tsallis_inf import TsallisINF
 from ltr.solvers.sor import sor
 from ltr.utils.random import truncated_normal
@@ -30,18 +31,33 @@ def run(T: int, trials: int, seed: int) -> None:
 
     epsilon = 1e-8
     omegas = np.linspace(1.0, 1.8, 5)
+    grid = np.linspace(1.0, 1.95, 20)
+    L = chain_laplacian(grid.size)
+    lam, U = np.linalg.eigh(L)
 
     omega_costs = np.zeros((T, trials, omegas.size))
     tinf_costs = np.zeros((T, trials))
+    exp3_costs = np.zeros((T, trials))
 
     rng_master = np.random.default_rng(seed)
 
-    def one_trial(dist_a: float, dist_b: float, trial_seed: int) -> tuple[np.ndarray, np.ndarray]:
+    def one_trial(dist_a: float, dist_b: float, trial_seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         print(f"trial {trial+1}/{trials}: starting")
         rng = np.random.default_rng(trial_seed)
-        tinf = TsallisINF(np.linspace(1.0, 1.95, 20), T=T)
+        tinf = TsallisINF(grid, T=T)
+        exp3 = Exp3Spectral(
+            grid=grid,
+            eigenvectors=U,
+            eigenvalues=lam,
+            # conservative defaults; tweak if you want more/less exploration
+            eta=0.05,
+            gamma=0.1,
+            mu=1e-2,
+            smoothness=1.0,
+        )
         omega_costs_local = np.zeros((T, omegas.size))
         tinf_costs_local = np.zeros(T)
+        exp3_costs_local = np.zeros(T)
 
         for t in range(T):
             if (t + 1) % 100 == 0:
@@ -54,28 +70,34 @@ def run(T: int, trials: int, seed: int) -> None:
             tinf_costs_local[t] = sor(At, bt, np.zeros(n), w, epsilon).iterations
             tinf.update(tinf_costs_local[t])
 
+            w2 = exp3.predict(rng=rng)
+            exp3_costs_local[t] = sor(At, bt, np.zeros(n), w2, epsilon).iterations
+            exp3.update(exp3_costs_local[t])
+
             for i, om in enumerate(omegas):
                 omega_costs_local[t, i] = sor(At, bt, np.zeros(n), float(om), epsilon).iterations
 
-        return omega_costs_local, tinf_costs_local
+        return omega_costs_local, tinf_costs_local, exp3_costs_local
 
 
     now = datetime.datetime.now()
-    filename = f"{now.strftime('%Y%m%d_%H%M')}_learning_high_variance.png"
+    filename = f"{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_high_variance.png"
     # High-variance
     for trial in range(trials):
-        oc, tc = one_trial(0.5, 1.5, int(rng_master.integers(0, 2**32 - 1)))
+        oc, tc, ec = one_trial(0.5, 1.5, int(rng_master.integers(0, 2**32 - 1)))
         omega_costs[:, trial, :] = oc
         tinf_costs[:, trial] = tc
+        exp3_costs[:, trial] = ec
 
     plots = ensure_plots_dir()
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, om in enumerate(omegas):
         ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
     ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
+    ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
     ax.set_xlabel("total iterations", fontsize=14)
     ax.set_ylabel("instances remaining", fontsize=14)
-    ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF"], fontsize=12)
+    ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
     fig.tight_layout()
     fig.savefig(plots / filename, dpi=256)
     plt.close(fig)
@@ -83,22 +105,25 @@ def run(T: int, trials: int, seed: int) -> None:
     # Low-variance
     omega_costs[:] = 0
     tinf_costs[:] = 0
+    exp3_costs[:] = 0
     for trial in range(trials):
-        oc, tc = one_trial(2.0, 6.0, int(rng_master.integers(0, 2**32 - 1)))
+        oc, tc, ec = one_trial(2.0, 6.0, int(rng_master.integers(0, 2**32 - 1)))
         omega_costs[:, trial, :] = oc
         tinf_costs[:, trial] = tc
+        exp3_costs[:, trial] = ec
 
 
 
-    filename = f"{now.strftime('%Y%m%d_%H%M')}_learning_low_variance.png"
+    filename = f"{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_low_variance.png"
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, om in enumerate(omegas):
         ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
     ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
+    ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
     ax.set_xlabel("total iterations", fontsize=14)
     ax.set_ylabel("instances remaining", fontsize=14)
-    ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF"], fontsize=12)
+    ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
     fig.tight_layout()
     fig.savefig(plots / filename, dpi=256)
     plt.close(fig)
