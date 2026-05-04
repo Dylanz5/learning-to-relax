@@ -35,6 +35,13 @@ class LearningExperimentConfig:
     exp3_gamma: float = 0.1
     exp3_mu: float = 1e-2
     exp3_smoothness: float = 1.0
+    #: Bandit feedback: ``"sor"`` (stationary iteration) or ``"ssor_pcg"``
+    #: (SSOR-preconditioned CG; MATLAB ``ssor_pcg`` / ``pcg``).
+    solver: str = "sor"
+
+    def __post_init__(self) -> None:
+        if self.solver not in ("sor", "ssor_pcg"):
+            raise ValueError("solver must be 'sor' or 'ssor_pcg', " f"got {self.solver!r}")
 
     def plot_prefix(self) -> str:
         name = (self.run_name or self.similarity_kind).strip()

@@ -17,6 +17,7 @@ from ltr.domains import delsq_numgrid
 from ltr.learners.exp3_spectral import Exp3Spectral
 from ltr.learners.tsallis_inf import TsallisINF
 from ltr.solvers.sor import precalc_lower_diag, sor
+from ltr.solvers.ssor_pcg import ssor_pcg
 from ltr.utils.random import truncated_normal
 
 import datetime
@@ -43,6 +44,7 @@ def _one_trial_worker(
     exp3_gamma: float = 0.1,
     exp3_mu: float = 1e-2,
     exp3_smoothness: float = 1.0,
+    solver: str = "sor",
 ) -> (
     tuple[np.ndarray, np.ndarray, np.ndarray]
     | tuple[np.ndarray, np.ndarray, np.ndarray, float]
@@ -69,11 +71,19 @@ def _one_trial_worker(
     At = A.copy().tocsr()
     base_diag = A.diagonal().copy()
 
-    sor_wall_s = 0.0
+    solver_wall_s = 0.0
     sor_timings: defaultdict[str, float] | None = defaultdict(float) if benchmark_sor_detail else None
 
-    def sor_iters(omega: float, L_csr: sp.csr_matrix, D_vec: np.ndarray) -> int:
-        nonlocal sor_wall_s
+    def solve_iters(omega: float, L_csr: sp.csr_matrix | None, D_vec: np.ndarray | None) -> int:
+        nonlocal solver_wall_s
+        if solver == "ssor_pcg":
+            if benchmark_solver:
+                t0 = time.perf_counter()
+                k = ssor_pcg(At, bt, None, omega, epsilon).iterations
+                solver_wall_s += time.perf_counter() - t0
+                return k
+            return ssor_pcg(At, bt, None, omega, epsilon).iterations
+        assert L_csr is not None and D_vec is not None
         if benchmark_solver:
             t0 = time.perf_counter()
             k = sor(
@@ -86,7 +96,7 @@ def _one_trial_worker(
                 diagonal=D_vec,
                 timings=sor_timings,
             ).iterations
-            sor_wall_s += time.perf_counter() - t0
+            solver_wall_s += time.perf_counter() - t0
             return k
         return sor(
             At,
@@ -104,18 +114,21 @@ def _one_trial_worker(
         c = -0.15 + 0.6 * beta_dist.rvs(dist_a, dist_b, random_state=rng)
         At.setdiag(base_diag + float(c))
         bt = truncated_normal(n, rng=rng)
-        L_at, D_at = precalc_lower_diag(At)
+        if solver == "sor":
+            L_at, D_at = precalc_lower_diag(At)
+        else:
+            L_at, D_at = None, None
 
         w = tinf.predict(rng=rng)
-        tinf_costs_local[t] = sor_iters(w, L_at, D_at)
+        tinf_costs_local[t] = solve_iters(w, L_at, D_at)
         tinf.update(tinf_costs_local[t])
 
         w2 = exp3.predict(rng=rng)
-        exp3_costs_local[t] = sor_iters(w2, L_at, D_at)
+        exp3_costs_local[t] = solve_iters(w2, L_at, D_at)
         exp3.update(exp3_costs_local[t])
 
         for i, om in enumerate(omegas):
-            omega_costs_local[t, i] = sor_iters(float(om), L_at, D_at)
+            omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
 
     if benchmark_solver:
         if benchmark_sor_detail:
@@ -124,10 +137,10 @@ def _one_trial_worker(
                 omega_costs_local,
                 tinf_costs_local,
                 exp3_costs_local,
-                sor_wall_s,
+                solver_wall_s,
                 dict(sor_timings),
             )
-        return omega_costs_local, tinf_costs_local, exp3_costs_local, sor_wall_s
+        return omega_costs_local, tinf_costs_local, exp3_costs_local, solver_wall_s
     return omega_costs_local, tinf_costs_local, exp3_costs_local
 
 
@@ -163,6 +176,13 @@ def run(
     T, trials, seed, jobs = cfg.T, cfg.trials, cfg.seed, cfg.jobs
     epsilon = cfg.epsilon
 
+    print(
+        f"[experiment] similarity_kind={cfg.similarity_kind!r} "
+        f"solver={cfg.solver!r} arms={grid.size} T={T} trials={trials} jobs={jobs} "
+        f"plot_prefix={cfg.plot_prefix()!r}",
+        flush=True,
+    )
+
     omega_costs = np.zeros((T, trials, omegas.size))
     tinf_costs = np.zeros((T, trials))
     exp3_costs = np.zeros((T, trials))
@@ -175,7 +195,7 @@ def run(
     # High-variance
     seeds = [int(rng_master.integers(0, 2**32 - 1)) for _ in range(trials)]
     t_block = time.perf_counter()
-    sor_sum_block = 0.0
+    solver_sum_block = 0.0
     sor_detail_sum: defaultdict[str, float] = defaultdict(float)
     with ProcessPoolExecutor(max_workers=(None if jobs <= 0 else jobs)) as ex:
         futures = [
@@ -200,19 +220,20 @@ def run(
                 exp3_gamma=cfg.exp3_gamma,
                 exp3_mu=cfg.exp3_mu,
                 exp3_smoothness=cfg.exp3_smoothness,
+                solver=cfg.solver,
             )
             for trial in range(trials)
         ]
         for trial, fut in enumerate(futures):
             out = fut.result()
             if benchmark_sor_detail:
-                oc, tc, ec, sor_sec, bd = out
-                sor_sum_block += sor_sec
+                oc, tc, ec, solver_sec, bd = out
+                solver_sum_block += solver_sec
                 for key, val in bd.items():
                     sor_detail_sum[key] += val
             elif benchmark_solver:
-                oc, tc, ec, sor_sec = out
-                sor_sum_block += sor_sec
+                oc, tc, ec, solver_sec = out
+                solver_sum_block += solver_sec
             else:
                 oc, tc, ec = out
             omega_costs[:, trial, :] = oc
@@ -223,9 +244,9 @@ def run(
         calls_per_trial = T * (2 + omegas.size)
         print(
             f"[benchmark] high_variance: parallel block wall {wall:.3f}s | "
-            f"sum SOR time over trials {sor_sum_block:.3f}s "
-            f"(~CPU·s in sor; mean {sor_sum_block / trials:.3f}s/trial | "
-            f"{calls_per_trial} sor calls/trial)"
+            f"sum solver time over trials {solver_sum_block:.3f}s "
+            f"(solver={cfg.solver!r}; mean {solver_sum_block / trials:.3f}s/trial | "
+            f"{calls_per_trial} solves/trial)"
         )
     if benchmark_sor_detail:
         _print_sor_breakdown("high_variance", dict(sor_detail_sum))
@@ -236,7 +257,7 @@ def run(
         ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
     ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
     ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
-    ax.set_xlabel("total iterations", fontsize=14)
+    ax.set_xlabel("total solver iterations", fontsize=14)
     ax.set_ylabel("instances remaining", fontsize=14)
     ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
     fig.tight_layout()
@@ -249,7 +270,7 @@ def run(
     exp3_costs[:] = 0
     seeds = [int(rng_master.integers(0, 2**32 - 1)) for _ in range(trials)]
     t_block = time.perf_counter()
-    sor_sum_block = 0.0
+    solver_sum_block = 0.0
     sor_detail_sum = defaultdict(float)
     with ProcessPoolExecutor(max_workers=(None if jobs <= 0 else jobs)) as ex:
         futures = [
@@ -274,19 +295,20 @@ def run(
                 exp3_gamma=cfg.exp3_gamma,
                 exp3_mu=cfg.exp3_mu,
                 exp3_smoothness=cfg.exp3_smoothness,
+                solver=cfg.solver,
             )
             for trial in range(trials)
         ]
         for trial, fut in enumerate(futures):
             out = fut.result()
             if benchmark_sor_detail:
-                oc, tc, ec, sor_sec, bd = out
-                sor_sum_block += sor_sec
+                oc, tc, ec, solver_sec, bd = out
+                solver_sum_block += solver_sec
                 for key, val in bd.items():
                     sor_detail_sum[key] += val
             elif benchmark_solver:
-                oc, tc, ec, sor_sec = out
-                sor_sum_block += sor_sec
+                oc, tc, ec, solver_sec = out
+                solver_sum_block += solver_sec
             else:
                 oc, tc, ec = out
             omega_costs[:, trial, :] = oc
@@ -297,9 +319,9 @@ def run(
         calls_per_trial = T * (2 + omegas.size)
         print(
             f"[benchmark] low_variance: parallel block wall {wall:.3f}s | "
-            f"sum SOR time over trials {sor_sum_block:.3f}s "
-            f"(~CPU·s in sor; mean {sor_sum_block / trials:.3f}s/trial | "
-            f"{calls_per_trial} sor calls/trial)"
+            f"sum solver time over trials {solver_sum_block:.3f}s "
+            f"(solver={cfg.solver!r}; mean {solver_sum_block / trials:.3f}s/trial | "
+            f"{calls_per_trial} solves/trial)"
         )
     if benchmark_sor_detail:
         _print_sor_breakdown("low_variance", dict(sor_detail_sum))
@@ -313,7 +335,7 @@ def run(
         ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
     ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
     ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
-    ax.set_xlabel("total iterations", fontsize=14)
+    ax.set_xlabel("total solver iterations", fontsize=14)
     ax.set_ylabel("instances remaining", fontsize=14)
     ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
     fig.tight_layout()
@@ -347,8 +369,10 @@ def main() -> None:
         "--similarity-kind",
         type=str,
         default=None,
-        choices=["chain", "ring"],
-        help="Graph Laplacian over arms for Exp3-Spectral (overrides config file).",
+        help=(
+            "Graph Laplacian over arms for Exp3-Spectral (overrides config file); "
+            "see ltr.bench.similarity.SIMILARITY_KINDS."
+        ),
     )
     p.add_argument(
         "--run-name",
@@ -357,19 +381,26 @@ def main() -> None:
         help="Prefix for plot filenames (overrides config file).",
     )
     p.add_argument(
+        "--solver",
+        type=str,
+        choices=("sor", "ssor_pcg"),
+        default=None,
+        help='Linear solver for feedback (default from config JSON or "sor").',
+    )
+    p.add_argument(
         "--benchmark-solver",
         action="store_true",
         help=(
-            "Print rough SOR timings: wall time for each parallel trial block vs "
-            "sum of per-trial time inside sor() (useful with small T/trials)."
+            "Print rough solver timings: wall time for each parallel trial block vs "
+            "sum of per-trial time inside the chosen solver (useful with small T/trials)."
         ),
     )
     p.add_argument(
         "--benchmark-sor-detail",
         action="store_true",
         help=(
-            "Break down time inside sor() (build M, triangular solve, matvec residual, norms); "
-            "implies --benchmark-solver."
+            "SOR only: break down time inside sor() (build M, triangular solve, "
+            "matvec residual, norms); implies --benchmark-solver."
         ),
     )
     args = p.parse_args()
@@ -393,6 +424,11 @@ def main() -> None:
         cfg.similarity_kind = args.similarity_kind
     if args.run_name is not None:
         cfg.run_name = args.run_name
+    if args.solver is not None:
+        cfg.solver = args.solver
+
+    if benchmark_sor_detail and cfg.solver != "sor":
+        p.error("--benchmark-sor-detail applies only with solver sor")
 
     run(
         cfg,
