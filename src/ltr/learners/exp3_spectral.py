@@ -4,21 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
-def chain_laplacian(k: int) -> np.ndarray:
-    """Unweighted chain-graph Laplacian on k nodes (0--1--...--k-1)."""
-    k = int(k)
-    if k <= 1:
-        return np.zeros((k, k), dtype=float)
-    L = np.zeros((k, k), dtype=float)
-    for i in range(k):
-        if i - 1 >= 0:
-            L[i, i - 1] = -1.0
-            L[i, i] += 1.0
-        if i + 1 < k:
-            L[i, i + 1] = -1.0
-            L[i, i] += 1.0
-    return L
+import scipy.sparse.linalg as spla
 
 
 @dataclass
@@ -38,7 +24,7 @@ class Exp3Spectral:
     gamma: float = 0.1  # exploration mixing
     mu: float = 1e-2  # regularization scale on eigenvalues
     exploration: np.ndarray | None = None  # q, shape (K,)
-
+    L: sp.csr_matrix | None = None
     def __post_init__(self) -> None:
         self.grid = np.asarray(self.grid, dtype=float).reshape(-1)
         self.K = int(self.grid.shape[0])
@@ -52,7 +38,6 @@ class Exp3Spectral:
 
         self.U = U
         self.lam = lam
-
         self.smoothness = float(self.smoothness)
         self.eta = float(self.eta)
         self.gamma = float(self.gamma)
@@ -120,34 +105,37 @@ class Exp3Spectral:
         # V = sum_i p(i) a_i a_i^T  where a_i are in eigenbasis (rows of U)
         # Efficiently: V = A^T diag(p) A, where A = arms (KxK).
         A = self.arms
-        V = A.T @ (p[:, None] * A)
+        #V = A.T @ (p[:, None] * A)
 
         # M = mu*diag(lam) + V  (symmetric PSD)
-        M = V + np.diag(self.mu * self.lam)
+        #M = V + np.diag(self.mu * self.lam)
 
+        M = self.mu*self.L + np.diag(p)
         # loss_vec_hat = M^{-1} a_it * loss
-        a_it = A[it, :]
+        #a_it = A[it, :]
+        hot = np.zeros(self.K, dtype=float)
+        hot[it] = 1.0
         try:
-            loss_vec_hat = np.linalg.solve(M, a_it * loss)
+            loss_vec_hat = spla.spsolve(M, hot * loss)
         except np.linalg.LinAlgError:
             # fallback: add tiny ridge if numerical issues
             ridge = 1e-9
-            loss_vec_hat = np.linalg.solve(M + ridge * np.eye(self.K), a_it * loss)
-
+            loss_vec_hat = spla.spsolve(M + ridge * np.eye(self.K), hot * loss)
+        
         # loss_hat over arms: U @ loss_vec_hat
-        loss_hat = self.U @ loss_vec_hat
+        loss_hat =loss_vec_hat
 
-        # bonus(i) = smoothness*sqrt(mu) * ||a_i||_{M^{-1}}
-        sqrt_mu = float(np.sqrt(max(self.mu, 0.0)))
-        bonus = np.zeros(self.K, dtype=float)
-        for i in range(self.K):
-            ai = A[i, :]
-            try:
-                x = np.linalg.solve(M, ai)
-            except np.linalg.LinAlgError:
-                x = np.linalg.solve(M + 1e-9 * np.eye(self.K), ai)
-            val = float(ai @ x)
-            bonus[i] = self.smoothness * sqrt_mu * float(np.sqrt(max(val, 0.0)))
+        # # bonus(i) = smoothness*sqrt(mu) * ||a_i||_{M^{-1}}
+        # sqrt_mu = float(np.sqrt(max(self.mu, 0.0)))
+        # bonus = np.zeros(self.K, dtype=float)
+        # for i in range(self.K):
+        #     hot = np.zeros(self.K, dtype=float)
+        #     hot[i] = 1.0
+        #     try:
+        #         x = spla.spsolve(M, hot)
+        #     except np.linalg.LinAlgError:
+        #         x = spla.spsolve(M + 1e-9 * np.eye(self.K), hot)
+        #     val = float(hot @ x)
+        #     bonus[i] = self.smoothness * sqrt_mu * float(np.sqrt(max(val, 0.0)))
 
-        self.S += (loss_hat - bonus)
-
+        self.S += loss_hat

@@ -1,5 +1,5 @@
 {
-  "T": 200,
+  "T": 5000,
   "domain_s": 12,
   "epsilon": 1e-8,
   "exp3_eta": 0.05,
@@ -7,19 +7,19 @@
   "exp3_mu": 0.01,
   "exp3_smoothness": 1.0,
   "grid_end": 1.95,
-  "grid_points": 20,
+  "grid_points": 512,
   "grid_start": 1.0,
   "high_var_dist_a": 0.5,
   "high_var_dist_b": 1.5,
-  "jobs": 1,
+  "jobs": 4,
   "low_var_dist_a": 2.0,
   "low_var_dist_b": 6.0,
   "omega_count": 5,
   "omega_end": 1.8,
   "omega_start": 1.0,
-  "run_name": "chain",
+  "run_name": "double-chain-128lv",
   "seed": 0,
   "similarity_kind": "chain",
   "solver": "sor",
-  "trials": 1
+  "trials": 4
 }

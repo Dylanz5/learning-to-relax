@@ -10,7 +10,7 @@ A = delsq(numgrid('S', 12));
 n = length(A);
 epsilon = 1E-8;
 T = 5000;
-trials = 40;
+trials = 2;
 omegas = linspace(1., 1.8, 5);
 omega_costs = zeros(T, trials, length(omegas));
 tinf_costs = zeros(T, trials);
@@ -22,13 +22,14 @@ parfor trial = 1:trials
         c = -.15 + .6 * betarnd(.5, 1.5);
         At = A + c * speye(n);
         bt = truncated_normal(n);
-        tinf_costs(t, trial) = sor(At, bt, zeros(n, 1), tinf.predict(), epsilon);
+        tinf_costs(t, trial) = ssor_pcg(At, bt, zeros(n, 1), tinf.predict(), epsilon);
         tinf.update(tinf_costs(t, trial));
         for i = 1:5
-            omega_costs(t, trial, i) = sor(At, bt, zeros(n, 1), omegas(i), epsilon);
+            omega_costs(t, trial, i) = ssor_pcg(At, bt, zeros(n, 1), omegas(i), epsilon);
         end
     end
 end
+
 
 ax = gca(figure(1));
 for i = 1:5
@@ -52,10 +53,10 @@ parfor trial = 1:trials
         c = -.15 + .6 * betarnd(2., 6.);
         At = A + c * speye(n);
         bt = truncated_normal(n);
-        tinf_costs(t, trial) = sor(At, bt, zeros(n, 1), tinf.predict(), epsilon);
+        tinf_costs(t, trial) = ssor_pcg(At, bt, zeros(n, 1), tinf.predict(), epsilon);
         tinf.update(tinf_costs(t, trial));
         for i = 1:5
-            omega_costs(t, trial, i) = sor(At, bt, zeros(n, 1), omegas(i), epsilon);
+            omega_costs(t, trial, i) = ssor_pcg(At, bt, zeros(n, 1), omegas(i), epsilon);
         end
     end
 end

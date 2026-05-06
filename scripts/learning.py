@@ -45,6 +45,7 @@ def _one_trial_worker(
     exp3_mu: float = 1e-2,
     exp3_smoothness: float = 1.0,
     solver: str = "sor",
+    L: sp.csr_matrix | None = None,
 ) -> (
     tuple[np.ndarray, np.ndarray, np.ndarray]
     | tuple[np.ndarray, np.ndarray, np.ndarray, float]
@@ -62,6 +63,7 @@ def _one_trial_worker(
         gamma=exp3_gamma,
         mu=exp3_mu,
         smoothness=exp3_smoothness,
+        L=L,
     )
     omega_costs_local = np.zeros((T, omegas.size))
     tinf_costs_local = np.zeros(T)
@@ -171,7 +173,7 @@ def run(
 
     omegas = np.linspace(cfg.omega_start, cfg.omega_end, cfg.omega_count)
     grid = np.linspace(cfg.grid_start, cfg.grid_end, cfg.grid_points)
-    U, lam = similarity_spectrum(grid.size, cfg.similarity_kind)
+    U, lam, L = similarity_spectrum(grid.size, cfg.similarity_kind)
 
     T, trials, seed, jobs = cfg.T, cfg.trials, cfg.seed, cfg.jobs
     epsilon = cfg.epsilon
@@ -191,78 +193,78 @@ def run(
 
     now = datetime.datetime.now()
     prefix = cfg.plot_prefix()
-    filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_high_variance.png"
-    # High-variance
-    seeds = [int(rng_master.integers(0, 2**32 - 1)) for _ in range(trials)]
-    t_block = time.perf_counter()
-    solver_sum_block = 0.0
-    sor_detail_sum: defaultdict[str, float] = defaultdict(float)
-    with ProcessPoolExecutor(max_workers=(None if jobs <= 0 else jobs)) as ex:
-        futures = [
-            ex.submit(
-                _one_trial_worker,
-                T=T,
-                omegas=omegas,
-                grid=grid,
-                eigenvectors=U,
-                eigenvalues=lam,
-                A=A,
-                n=n,
-                epsilon=epsilon,
-                dist_a=cfg.high_var_dist_a,
-                dist_b=cfg.high_var_dist_b,
-                trial_seed=seeds[trial],
-                trial=trial,
-                trials=trials,
-                benchmark_solver=benchmark_solver,
-                benchmark_sor_detail=benchmark_sor_detail,
-                exp3_eta=cfg.exp3_eta,
-                exp3_gamma=cfg.exp3_gamma,
-                exp3_mu=cfg.exp3_mu,
-                exp3_smoothness=cfg.exp3_smoothness,
-                solver=cfg.solver,
-            )
-            for trial in range(trials)
-        ]
-        for trial, fut in enumerate(futures):
-            out = fut.result()
-            if benchmark_sor_detail:
-                oc, tc, ec, solver_sec, bd = out
-                solver_sum_block += solver_sec
-                for key, val in bd.items():
-                    sor_detail_sum[key] += val
-            elif benchmark_solver:
-                oc, tc, ec, solver_sec = out
-                solver_sum_block += solver_sec
-            else:
-                oc, tc, ec = out
-            omega_costs[:, trial, :] = oc
-            tinf_costs[:, trial] = tc
-            exp3_costs[:, trial] = ec
-    if benchmark_solver:
-        wall = time.perf_counter() - t_block
-        calls_per_trial = T * (2 + omegas.size)
-        print(
-            f"[benchmark] high_variance: parallel block wall {wall:.3f}s | "
-            f"sum solver time over trials {solver_sum_block:.3f}s "
-            f"(solver={cfg.solver!r}; mean {solver_sum_block / trials:.3f}s/trial | "
-            f"{calls_per_trial} solves/trial)"
-        )
-    if benchmark_sor_detail:
-        _print_sor_breakdown("high_variance", dict(sor_detail_sum))
-
-    plots = ensure_plots_dir()
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for i, om in enumerate(omegas):
-        ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
-    ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
-    ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
-    ax.set_xlabel("total solver iterations", fontsize=14)
-    ax.set_ylabel("instances remaining", fontsize=14)
-    ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
-    fig.tight_layout()
-    fig.savefig(plots / filename, dpi=256)
-    plt.close(fig)
+    # # High-variance (disabled)
+    # filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_high_variance.png"
+    # seeds = [int(rng_master.integers(0, 2**32 - 1)) for _ in range(trials)]
+    # t_block = time.perf_counter()
+    # solver_sum_block = 0.0
+    # sor_detail_sum: defaultdict[str, float] = defaultdict(float)
+    # with ProcessPoolExecutor(max_workers=(None if jobs <= 0 else jobs)) as ex:
+    #     futures = [
+    #         ex.submit(
+    #             _one_trial_worker,
+    #             T=T,
+    #             omegas=omegas,
+    #             grid=grid,
+    #             eigenvectors=U,
+    #             eigenvalues=lam,
+    #             A=A,
+    #             n=n,
+    #             epsilon=epsilon,
+    #             dist_a=cfg.high_var_dist_a,
+    #             dist_b=cfg.high_var_dist_b,
+    #             trial_seed=seeds[trial],
+    #             trial=trial,
+    #             trials=trials,
+    #             benchmark_solver=benchmark_solver,
+    #             benchmark_sor_detail=benchmark_sor_detail,
+    #             exp3_eta=cfg.exp3_eta,
+    #             exp3_gamma=cfg.exp3_gamma,
+    #             exp3_mu=cfg.exp3_mu,
+    #             exp3_smoothness=cfg.exp3_smoothness,
+    #             solver=cfg.solver,
+    #         )
+    #         for trial in range(trials)
+    #     ]
+    #     for trial, fut in enumerate(futures):
+    #         out = fut.result()
+    #         if benchmark_sor_detail:
+    #             oc, tc, ec, solver_sec, bd = out
+    #             solver_sum_block += solver_sec
+    #             for key, val in bd.items():
+    #                 sor_detail_sum[key] += val
+    #         elif benchmark_solver:
+    #             oc, tc, ec, solver_sec = out
+    #             solver_sum_block += solver_sec
+    #         else:
+    #             oc, tc, ec = out
+    #         omega_costs[:, trial, :] = oc
+    #         tinf_costs[:, trial] = tc
+    #         exp3_costs[:, trial] = ec
+    # if benchmark_solver:
+    #     wall = time.perf_counter() - t_block
+    #     calls_per_trial = T * (2 + omegas.size)
+    #     print(
+    #         f"[benchmark] high_variance: parallel block wall {wall:.3f}s | "
+    #         f"sum solver time over trials {solver_sum_block:.3f}s "
+    #         f"(solver={cfg.solver!r}; mean {solver_sum_block / trials:.3f}s/trial | "
+    #         f"{calls_per_trial} solves/trial)"
+    #     )
+    # if benchmark_sor_detail:
+    #     _print_sor_breakdown("high_variance", dict(sor_detail_sum))
+    #
+    # plots = ensure_plots_dir()
+    # fig, ax = plt.subplots(figsize=(7, 5))
+    # for i, om in enumerate(omegas):
+    #     ax.plot(np.mean(np.cumsum(omega_costs[:, :, i], axis=0), axis=1), T - np.arange(1, T + 1), lw=2, ls="--")
+    # ax.plot(np.mean(np.cumsum(tinf_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2, color="black")
+    # ax.plot(np.mean(np.cumsum(exp3_costs, axis=0), axis=1), T - np.arange(1, T + 1), lw=2)
+    # ax.set_xlabel("total solver iterations", fontsize=14)
+    # ax.set_ylabel("instances remaining", fontsize=14)
+    # ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
+    # fig.tight_layout()
+    # fig.savefig(plots / filename, dpi=256)
+    # plt.close(fig)
 
     # Low-variance
     omega_costs[:] = 0
@@ -296,6 +298,7 @@ def run(
                 exp3_mu=cfg.exp3_mu,
                 exp3_smoothness=cfg.exp3_smoothness,
                 solver=cfg.solver,
+                L=L,
             )
             for trial in range(trials)
         ]
@@ -326,8 +329,7 @@ def run(
     if benchmark_sor_detail:
         _print_sor_breakdown("low_variance", dict(sor_detail_sum))
 
-
-
+    plots = ensure_plots_dir()
     filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_low_variance.png"
 
     fig, ax = plt.subplots(figsize=(7, 5))
