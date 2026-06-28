@@ -20,6 +20,7 @@ def chain_laplacian(k: int) -> np.ndarray:
         return np.zeros((k, k), dtype=float)
     adj = np.zeros((k, k), dtype=float)
     for i in range(k):
+        adj[i,i] = 1.0
         if i - 1 >= 0:
             adj[i, i - 1] = 1.0
         if i + 1 < k:

@@ -130,7 +130,8 @@ def _one_trial_worker(
         exp3.update(exp3_costs_local[t])
 
         for i, om in enumerate(omegas):
-            omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
+            pass
+            #omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
 
     if benchmark_solver:
         if benchmark_sor_detail:
@@ -331,6 +332,23 @@ def run(
 
     plots = ensure_plots_dir()
     filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_low_variance.png"
+    losses_path = plots / Path(filename).with_suffix(".npz")
+    np.savez_compressed(
+        losses_path,
+        tinf_costs=tinf_costs.astype(np.int64, copy=False),
+        exp3_costs=exp3_costs.astype(np.int64, copy=False),
+        #omega_costs=omega_costs.astype(np.int64, copy=False),
+        omegas=np.asarray(omegas, dtype=np.float64),
+        T=np.int32(T),
+        trials=np.int32(trials),
+        seed=np.int32(seed),
+        trial_seeds=np.asarray(seeds, dtype=np.int64),
+        variance_regime=np.array("low_variance"),
+    )
+    print(
+        f"[experiment] saved per-step iteration counts (Tsallis-INF, Exp3, fixed omegas) to {losses_path!s}",
+        flush=True,
+    )
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, om in enumerate(omegas):

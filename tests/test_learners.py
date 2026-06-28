@@ -3,7 +3,8 @@ from __future__ import annotations
 import numpy as np
 
 from ltr.learners.chebcb import ChebCB
-from ltr.learners.exp3_spectral import Exp3Spectral, chain_laplacian
+from ltr.bench.similarity import chain_laplacian
+from ltr.learners.exp3_spectral import Exp3Spectral
 from ltr.learners.tsallis_inf import TsallisINF
 from ltr.learners.tsallis_inf_cb import TsallisINFCB
 
