@@ -24,6 +24,7 @@ class TsallisINF:
         # weights (not necessarily normalized to sum exactly to 1).
         self.prob: float = 1.0 / self.d
         self.scale: float = 1.0
+        self._last_p = np.ones(self.d, dtype=float) / float(self.d)
 
         if self.T and self.T > 0:
             self.actions = np.zeros(self.T, dtype=int)
@@ -77,6 +78,7 @@ class TsallisINF:
                 raise ValueError("invalid sampling distribution")
 
             idx = int(rng.choice(self.d, p=p))
+            self._last_p = p.copy()
             w = float(probs[idx])
             # MATLAB stores the raw weight; fall back to true probability if needed.
             if np.isfinite(w) and w > 0:
@@ -85,6 +87,7 @@ class TsallisINF:
                 prob_for_update = float(p[idx]) if float(p[idx]) > 0 else (1.0 / self.d)
         except Exception:
             idx = int(rng.integers(0, self.d))
+            self._last_p = np.ones(self.d, dtype=float) / float(self.d)
             # MATLAB's implementation still assigns `prob = probs(index)` after the
             # catch block. To stay close while remaining numerically safe, use the
             # raw weight when it's valid; otherwise use the uniform probability.
@@ -100,6 +103,10 @@ class TsallisINF:
         self._ensure_capacity()
         self.actions[self.t - 1] = idx
         return float(self.grid[idx])
+
+    def action_probabilities(self) -> np.ndarray:
+        """Return the last sampling distribution over arms."""
+        return np.asarray(self._last_p, dtype=float).copy()
  
     def update(self, loss: float) -> None:
         if self.index is None:

@@ -6,12 +6,12 @@
   "exp3_gamma": 0.001,
   "exp3_mu": 0.01,
   "exp3_smoothness": 0.01,
-  "grid_end": 1.95,
-  "grid_points": 256,
   "grid_start": 1.0,
+  "grid_end": 1.95,
+  "grid_points": 128,
   "high_var_dist_a": 0.5,
   "high_var_dist_b": 1.5,
-  "jobs": 6,
+  "jobs": 1,
   "low_var_dist_a": 2.0,
   "low_var_dist_b": 6.0,
   "omega_count": 5,
@@ -21,5 +21,5 @@
   "seed": 0,
   "similarity_kind": "double_chain",
   "solver": "sor",
-  "trials": 20
+  "trials": 1
 }

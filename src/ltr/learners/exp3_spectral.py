@@ -158,6 +158,12 @@ class Exp3Spectral:
 
         self.S += (loss_hat - bonus)
 
+    def action_probabilities(self) -> np.ndarray:
+        """Return the last sampling distribution over arms."""
+        if self._last_p is None:
+            return np.ones(self.K, dtype=float) / float(self.K)
+        return np.asarray(self._last_p, dtype=float).copy()
+
 
     def gradient(self, x, L, mu):
         grad = np.zeros(self.K)

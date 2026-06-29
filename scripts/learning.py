@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
+
+# Stabilize native stack defaults for repeatable CLI runs.
+# These apply only if the user has not already set them.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.sparse as sp
-from scipy.stats import beta as beta_dist
 
 from ltr.bench.config import LearningExperimentConfig
 from ltr.bench.similarity import similarity_spectrum
@@ -47,9 +55,9 @@ def _one_trial_worker(
     solver: str = "sor",
     L: sp.csr_matrix | None = None,
 ) -> (
-    tuple[np.ndarray, np.ndarray, np.ndarray]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, float]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, float, dict[str, float]]
+    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
 ):
     if trial is not None and trials is not None:
         print(f"trial {trial+1}/{trials}: starting")
@@ -65,9 +73,20 @@ def _one_trial_worker(
         smoothness=exp3_smoothness,
         L=L,
     )
+    learners: dict[str, Any] = {
+        "tinf": tinf,
+        "exp3": exp3,
+    }
     omega_costs_local = np.zeros((T, omegas.size))
     tinf_costs_local = np.zeros(T)
     exp3_costs_local = np.zeros(T)
+    learner_costs_local: dict[str, np.ndarray] = {
+        "tinf": tinf_costs_local,
+        "exp3": exp3_costs_local,
+    }
+    learner_probs_local: dict[str, np.ndarray] = {
+        name: np.zeros((T, grid.size), dtype=np.float64) for name in learners
+    }
 
     # Reuse sparsity pattern: At = A + c I only shifts the diagonal (same as per-step eye sum).
     At = A.copy().tocsr()
@@ -110,10 +129,41 @@ def _one_trial_worker(
             diagonal=D_vec,
         ).iterations
 
+    def _extract_action_probs(learner: Any, n_arms: int) -> np.ndarray | None:
+        """Best-effort extraction of the learner's latest arm distribution."""
+        candidates = (
+            "action_probabilities",
+            "get_action_probabilities",
+            "last_action_probabilities",
+        )
+        for attr in candidates:
+            fn = getattr(learner, attr, None)
+            if callable(fn):
+                try:
+                    arr = np.asarray(fn(), dtype=float).reshape(-1)
+                except Exception:
+                    continue
+                if arr.shape == (n_arms,) and np.all(np.isfinite(arr)) and float(np.sum(arr)) > 0:
+                    arr = np.maximum(arr, 0.0)
+                    s = float(np.sum(arr))
+                    if s > 0:
+                        return arr / s
+        for attr in ("_last_p", "last_p", "p"):
+            raw = getattr(learner, attr, None)
+            if raw is None:
+                continue
+            arr = np.asarray(raw, dtype=float).reshape(-1)
+            if arr.shape == (n_arms,) and np.all(np.isfinite(arr)) and float(np.sum(arr)) > 0:
+                arr = np.maximum(arr, 0.0)
+                s = float(np.sum(arr))
+                if s > 0:
+                    return arr / s
+        return None
+
     for t in range(T):
         if trial is not None and trials is not None and (t + 1) % 100 == 0:
             print(f"trial {trial+1}/{trials}: step {t+1}/{T}")
-        c = -0.15 + 0.6 * beta_dist.rvs(dist_a, dist_b, random_state=rng)
+        c = -0.15 + 0.6 * float(rng.beta(dist_a, dist_b))
         At.setdiag(base_diag + float(c))
         bt = truncated_normal(n, rng=rng)
         if solver == "sor":
@@ -121,17 +171,17 @@ def _one_trial_worker(
         else:
             L_at, D_at = None, None
 
-        w = tinf.predict(rng=rng)
-        tinf_costs_local[t] = solve_iters(w, L_at, D_at)
-        tinf.update(tinf_costs_local[t])
-
-        w2 = exp3.predict(rng=rng)
-        exp3_costs_local[t] = solve_iters(w2, L_at, D_at)
-        exp3.update(exp3_costs_local[t])
+        for learner_name, learner in learners.items():
+            action = learner.predict(rng=rng)
+            probs = _extract_action_probs(learner, grid.size)
+            if probs is not None:
+                learner_probs_local[learner_name][t, :] = probs
+            loss = solve_iters(action, L_at, D_at)
+            learner_costs_local[learner_name][t] = loss
+            learner.update(loss)
 
         for i, om in enumerate(omegas):
-            pass
-            #omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
+            omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
 
     if benchmark_solver:
         if benchmark_sor_detail:
@@ -140,11 +190,12 @@ def _one_trial_worker(
                 omega_costs_local,
                 tinf_costs_local,
                 exp3_costs_local,
+                learner_probs_local,
                 solver_wall_s,
                 dict(sor_timings),
             )
-        return omega_costs_local, tinf_costs_local, exp3_costs_local, solver_wall_s
-    return omega_costs_local, tinf_costs_local, exp3_costs_local
+        return omega_costs_local, tinf_costs_local, exp3_costs_local, learner_probs_local, solver_wall_s
+    return omega_costs_local, tinf_costs_local, exp3_costs_local, learner_probs_local
 
 
 def ensure_plots_dir() -> Path:
@@ -160,6 +211,123 @@ def _print_sor_breakdown(label: str, merged: dict[str, float]) -> None:
         return
     parts = [f"{k}={merged[k]:.3f}s ({100.0 * merged[k] / total:.1f}%)" for k in sorted(merged)]
     print(f"[benchmark] {label} sor_detail sum over trials (~CPU·s): " + " | ".join(parts))
+
+
+def _plot_action_probability_heatmap(prob_matrix: np.ndarray, out_path: Path, *, title: str) -> None:
+    """Plot arm-choice probability heatmap with y=arm and x=time."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    p = np.asarray(prob_matrix, dtype=float)
+    if p.ndim != 2:
+        raise ValueError(f"expected 2D matrix (T, arms), got shape {p.shape}")
+
+    T, n_arms = p.shape
+    fig, ax = plt.subplots(figsize=(10, 5))
+    im = ax.imshow(
+        p.T,
+        origin="lower",
+        aspect="auto",
+        interpolation="nearest",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=max(1e-12, float(np.max(p))),
+    )
+    ax.set_xlabel("time step", fontsize=12)
+    ax.set_ylabel("arm index", fontsize=12)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlim(0, max(0, T - 1))
+    ax.set_ylim(0, max(0, n_arms - 1))
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("selection probability", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=256)
+    plt.close(fig)
+
+
+def _run_trials(
+    *,
+    T: int,
+    trials: int,
+    jobs: int,
+    omegas: np.ndarray,
+    grid: np.ndarray,
+    U: np.ndarray,
+    lam: np.ndarray,
+    A: sp.csr_matrix,
+    n: int,
+    epsilon: float,
+    dist_a: float,
+    dist_b: float,
+    seeds: list[int],
+    benchmark_solver: bool,
+    benchmark_sor_detail: bool,
+    cfg: LearningExperimentConfig,
+    L: sp.csr_matrix,
+) -> list[
+    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
+]:
+    """Run all trials without subprocesses.
+
+    jobs == 1 runs serially in the current process.
+    jobs <= 0 uses a thread pool sized to available CPUs.
+    jobs > 1 runs trial workers on a thread pool with that many workers.
+    """
+    if jobs <= 0:
+        max_workers = max(1, os.cpu_count() or 1)
+    else:
+        max_workers = max(1, jobs)
+    worker_kwargs = dict(
+        T=T,
+        omegas=omegas,
+        grid=grid,
+        eigenvectors=U,
+        eigenvalues=lam,
+        A=A,
+        n=n,
+        epsilon=epsilon,
+        dist_a=dist_a,
+        dist_b=dist_b,
+        benchmark_solver=benchmark_solver,
+        benchmark_sor_detail=benchmark_sor_detail,
+        exp3_eta=cfg.exp3_eta,
+        exp3_gamma=cfg.exp3_gamma,
+        exp3_mu=cfg.exp3_mu,
+        exp3_smoothness=cfg.exp3_smoothness,
+        solver=cfg.solver,
+        L=L,
+    )
+
+    results: list[
+        tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
+    ] = [None] * trials
+    if max_workers == 1:
+        for trial in range(trials):
+            results[trial] = _one_trial_worker(
+                trial_seed=seeds[trial],
+                trial=trial,
+                trials=trials,
+                **worker_kwargs,
+            )
+        return results
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        fut_to_trial = {
+            ex.submit(
+                _one_trial_worker,
+                trial_seed=seeds[trial],
+                trial=trial,
+                trials=trials,
+                **worker_kwargs,
+            ): trial
+            for trial in range(trials)
+        }
+        for fut in as_completed(fut_to_trial):
+            trial = fut_to_trial[fut]
+            results[trial] = fut.result()
+    return results
 
 
 def run(
@@ -189,6 +357,10 @@ def run(
     omega_costs = np.zeros((T, trials, omegas.size))
     tinf_costs = np.zeros((T, trials))
     exp3_costs = np.zeros((T, trials))
+    learner_prob_histories: dict[str, np.ndarray] = {
+        "tinf": np.zeros((T, trials, grid.size), dtype=np.float64),
+        "exp3": np.zeros((T, trials, grid.size), dtype=np.float64),
+    }
 
     rng_master = np.random.default_rng(seed)
 
@@ -275,54 +447,54 @@ def run(
     t_block = time.perf_counter()
     solver_sum_block = 0.0
     sor_detail_sum = defaultdict(float)
-    with ProcessPoolExecutor(max_workers=(None if jobs <= 0 else jobs)) as ex:
-        futures = [
-            ex.submit(
-                _one_trial_worker,
-                T=T,
-                omegas=omegas,
-                grid=grid,
-                eigenvectors=U,
-                eigenvalues=lam,
-                A=A,
-                n=n,
-                epsilon=epsilon,
-                dist_a=cfg.low_var_dist_a,
-                dist_b=cfg.low_var_dist_b,
-                trial_seed=seeds[trial],
-                trial=trial,
-                trials=trials,
-                benchmark_solver=benchmark_solver,
-                benchmark_sor_detail=benchmark_sor_detail,
-                exp3_eta=cfg.exp3_eta,
-                exp3_gamma=cfg.exp3_gamma,
-                exp3_mu=cfg.exp3_mu,
-                exp3_smoothness=cfg.exp3_smoothness,
-                solver=cfg.solver,
-                L=L,
-            )
-            for trial in range(trials)
-        ]
-        for trial, fut in enumerate(futures):
-            out = fut.result()
-            if benchmark_sor_detail:
-                oc, tc, ec, solver_sec, bd = out
-                solver_sum_block += solver_sec
-                for key, val in bd.items():
-                    sor_detail_sum[key] += val
-            elif benchmark_solver:
-                oc, tc, ec, solver_sec = out
-                solver_sum_block += solver_sec
-            else:
-                oc, tc, ec = out
-            omega_costs[:, trial, :] = oc
-            tinf_costs[:, trial] = tc
-            exp3_costs[:, trial] = ec
+    if jobs <= 0:
+        print(
+            "[experiment] jobs<=0: running in-process thread pool "
+            f"with {max(1, os.cpu_count() or 1)} workers (no subprocesses)",
+            flush=True,
+        )
+    out_by_trial = _run_trials(
+        T=T,
+        trials=trials,
+        jobs=jobs,
+        omegas=omegas,
+        grid=grid,
+        U=U,
+        lam=lam,
+        A=A,
+        n=n,
+        epsilon=epsilon,
+        dist_a=cfg.low_var_dist_a,
+        dist_b=cfg.low_var_dist_b,
+        seeds=seeds,
+        benchmark_solver=benchmark_solver,
+        benchmark_sor_detail=benchmark_sor_detail,
+        cfg=cfg,
+        L=L,
+    )
+    for trial, out in enumerate(out_by_trial):
+        if benchmark_sor_detail:
+            oc, tc, ec, learner_probs, solver_sec, bd = out
+            solver_sum_block += solver_sec
+            for key, val in bd.items():
+                sor_detail_sum[key] += val
+        elif benchmark_solver:
+            oc, tc, ec, learner_probs, solver_sec = out
+            solver_sum_block += solver_sec
+        else:
+            oc, tc, ec, learner_probs = out
+        omega_costs[:, trial, :] = oc
+        tinf_costs[:, trial] = tc
+        exp3_costs[:, trial] = ec
+        for name, arr in learner_probs.items():
+            if name not in learner_prob_histories:
+                learner_prob_histories[name] = np.zeros((T, trials, grid.size), dtype=np.float64)
+            learner_prob_histories[name][:, trial, :] = arr
     if benchmark_solver:
         wall = time.perf_counter() - t_block
         calls_per_trial = T * (2 + omegas.size)
         print(
-            f"[benchmark] low_variance: parallel block wall {wall:.3f}s | "
+            f"[benchmark] low_variance: trial block wall {wall:.3f}s | "
             f"sum solver time over trials {solver_sum_block:.3f}s "
             f"(solver={cfg.solver!r}; mean {solver_sum_block / trials:.3f}s/trial | "
             f"{calls_per_trial} solves/trial)"
@@ -337,7 +509,9 @@ def run(
         losses_path,
         tinf_costs=tinf_costs.astype(np.int64, copy=False),
         exp3_costs=exp3_costs.astype(np.int64, copy=False),
-        #omega_costs=omega_costs.astype(np.int64, copy=False),
+        omega_costs=omega_costs.astype(np.int64, copy=False),
+        tinf_action_probs=learner_prob_histories["tinf"].astype(np.float32, copy=False),
+        exp3_action_probs=learner_prob_histories["exp3"].astype(np.float32, copy=False),
         omegas=np.asarray(omegas, dtype=np.float64),
         T=np.int32(T),
         trials=np.int32(trials),
@@ -349,6 +523,17 @@ def run(
         f"[experiment] saved per-step iteration counts (Tsallis-INF, Exp3, fixed omegas) to {losses_path!s}",
         flush=True,
     )
+
+    for learner_name, probs in learner_prob_histories.items():
+        # Aggregate across trials for a single interpretable heatmap per learner.
+        mean_probs = np.mean(probs, axis=1)
+        heatmap_path = plots / f"{Path(filename).stem}_{learner_name}_action_probs.png"
+        _plot_action_probability_heatmap(
+            mean_probs,
+            heatmap_path,
+            title=f"{learner_name}: arm selection probability over time",
+        )
+        print(f"[experiment] wrote action-probability heatmap to {heatmap_path!s}", flush=True)
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, om in enumerate(omegas):
@@ -383,7 +568,7 @@ def main() -> None:
         "--jobs",
         type=int,
         default=None,
-        help="Number of parallel trial workers (<=0 uses all cores).",
+        help="Number of trial workers (1 runs serially; <=0 uses CPU-count threads; >1 uses that many threads).",
     )
     p.add_argument(
         "--similarity-kind",
