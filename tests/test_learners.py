@@ -7,6 +7,7 @@ from ltr.bench.similarity import chain_laplacian
 from ltr.learners.exp3_spectral import Exp3Spectral
 from ltr.learners.tsallis_inf import TsallisINF
 from ltr.learners.tsallis_inf_cb import TsallisINFCB
+from ltr.learners.tsallis_spectral import TsallisSpectral
 
 
 def test_exp3_spectral_runs() -> None:
@@ -18,6 +19,39 @@ def test_exp3_spectral_runs() -> None:
     for _ in range(5):
         _ = alg.predict(rng=rng)
         alg.update(float(rng.integers(1, 100)))
+
+
+def test_tsallis_spectral_runs() -> None:
+    rng = np.random.default_rng(0)
+    grid = np.linspace(1.0, 1.95, 7)
+    L = chain_laplacian(grid.size)
+    lam, U = np.linalg.eigh(L)
+    alg = TsallisSpectral(
+        grid=grid, eigenvectors=U, eigenvalues=lam, eta=0.05, gamma=0.2, mu=1e-2, smoothness=1.0, alpha=0.5, L=L
+    )
+    for _ in range(5):
+        action = alg.predict(rng=rng)
+        assert grid.min() <= action <= grid.max()
+        alg.update(float(rng.integers(1, 100)))
+
+
+def test_tsallis_spectral_q_solver_is_valid_distribution() -> None:
+    """Algorithm 4 must return a normalized distribution for a range of alpha."""
+    grid = np.linspace(1.0, 1.95, 9)
+    L = chain_laplacian(grid.size)
+    lam, U = np.linalg.eigh(L)
+    rng = np.random.default_rng(1)
+    for alpha in (0.25, 0.5, 0.75, 0.9):
+        alg = TsallisSpectral(
+            grid=grid, eigenvectors=U, eigenvalues=lam, eta=0.1, gamma=0.1, mu=1e-2, alpha=alpha, L=L
+        )
+        F = rng.normal(size=grid.size)
+        q = alg._solve_q(F)
+        assert np.all(q >= 0.0)
+        assert np.all(np.isfinite(q))
+        assert abs(float(np.sum(q)) - 1.0) < 1e-6
+        # Tsallis FTRL prefers small cumulative loss: argmin(F) gets the most mass.
+        assert int(np.argmax(q)) == int(np.argmin(F))
 
 
 def test_tsallis_inf_runs() -> None:

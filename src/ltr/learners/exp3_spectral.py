@@ -69,6 +69,12 @@ class Exp3Spectral:
         # Cumulative scores S_i = sum_{s<t} (loss_hat_s(i) - bonus_s(i))
         self.S = np.zeros(self.K, dtype=float)
 
+        # Running loss-mean used to normalize feedback to O(1), so the algorithm
+        # is invariant to the absolute loss scale (e.g. SOR iteration counts ~100
+        # vs. precomputed losses ~0.1). Replaces a previously hardcoded constant.
+        self._loss_running_sum: float = 0.0
+        self._loss_running_count: int = 0
+
         # Last prediction state (used by update)
         self._last_p: np.ndarray | None = None
         self._last_i: int | None = None
@@ -105,7 +111,14 @@ class Exp3Spectral:
         if self._last_p is None or self._last_i is None:
             raise RuntimeError("predict() must be called before update()")
 
-        loss = float(loss)/99.72476923076923
+        # Normalize by the running mean loss so feedback is O(1) regardless of
+        # the dataset's absolute loss scale (self-calibrating; no magic constant).
+        self._loss_running_sum += float(loss)
+        self._loss_running_count += 1
+        loss_scale = self._loss_running_sum / self._loss_running_count
+        if (not np.isfinite(loss_scale)) or loss_scale <= 0.0:
+            loss_scale = 1.0
+        loss = float(loss) / loss_scale
         p = self._last_p
         it = int(self._last_i)
 
@@ -146,15 +159,15 @@ class Exp3Spectral:
         # bonus(i) = smoothness*sqrt(mu) * ||a_i||_{M^{-1}}
         sqrt_mu = float(np.sqrt(max(self.mu, 0.0)))
         bonus = np.zeros(self.K, dtype=float)
-        for i in range(self.K):
-            hot = np.zeros(self.K, dtype=float)
-            hot[i] = 1.0
-            try:
-                x = spla.spsolve(M, hot)
-            except np.linalg.LinAlgError:
-                x = spla.spsolve(M + 1e-9 * np.eye(self.K), hot)
-            val = float(x[i])
-            bonus[i] = self.smoothness * sqrt_mu * float(np.sqrt(max(val, 0.0)))
+        #for i in range(self.K):
+        #    hot = np.zeros(self.K, dtype=float)
+        #    hot[i] = 1.0
+        #    try:
+        #        x = spla.spsolve(M, hot)
+        #    except np.linalg.LinAlgError:
+        #        x = spla.spsolve(M + 1e-9 * np.eye(self.K), hot)
+        #    val = float(x[i])
+        #    bonus[i] = self.smoothness * sqrt_mu * float(np.sqrt(max(val, 0.0)))
 
         self.S += (loss_hat - bonus)
 
@@ -166,11 +179,19 @@ class Exp3Spectral:
 
 
     def gradient(self, x, L, mu):
+        # Gradient of the regularized D-optimal objective f(p) = log det(mu*Lambda_L + V(p))
+        # from Lemma 5.1. In the node basis this is grad_i = [(mu*L + diag(p))^{-1}]_{ii},
+        # where diag(p) = V(p). The design distribution ``x`` (=p) MUST enter here; using a
+        # fixed identity in its place makes the gradient constant and collapses Frank-Wolfe
+        # onto a single vertex.
+        x = np.asarray(x, dtype=float).reshape(-1)
+        M = (mu * sp.csr_matrix(L) + sp.diags(x, offsets=0, shape=(self.K, self.K))).tocsc()
         grad = np.zeros(self.K)
         for i in range(self.K):
             hot = np.zeros(self.K)
-            hot[i] = 1
-            grad[i] = -(spla.spsolve(mu * L + sp.eye(self.K), hot)[i])
+            #grad[i] = -(spla.spsolve(mu * L + sp.eye(self.K), hot)[i])
+            hot[i] = 1.0
+            grad[i] = -(spla.spsolve(M, hot)[i])
         return grad
 
 

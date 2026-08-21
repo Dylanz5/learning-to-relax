@@ -35,6 +35,13 @@ class LearningExperimentConfig:
     exp3_gamma: float = 0.1
     exp3_mu: float = 1e-2
     exp3_smoothness: float = 1.0
+    #: Spectral Tsallis (Algorithm 2) hyperparameters. ``alpha`` is the Tsallis
+    #: entropy parameter in (0, 1); at 1/2 the q_t solver matches Tsallis-INF.
+    tsallis_spectral_eta: float = 0.05
+    tsallis_spectral_gamma: float = 0.1
+    tsallis_spectral_mu: float = 1e-2
+    tsallis_spectral_smoothness: float = 1.0
+    tsallis_spectral_alpha: float = 0.5
     #: Bandit feedback: ``"sor"`` (stationary iteration) or ``"ssor_pcg"``
     #: (SSOR-preconditioned CG; MATLAB ``ssor_pcg`` / ``pcg``).
     solver: str = "sor"
@@ -46,6 +53,25 @@ class LearningExperimentConfig:
     def plot_prefix(self) -> str:
         name = (self.run_name or self.similarity_kind).strip()
         return f"{name}_" if name else ""
+
+    def param_tag(self) -> str:
+        """Compact, filename-safe tag encoding the Exp3 hyperparameters.
+
+        Uses ``ep``/``et``/``g``/``mu``/``sm`` for epsilon, eta, gamma, mu and
+        smoothness. Decimal points are rendered as ``p`` so the tag stays a
+        single dot-free path component (e.g. ``ep1e-08_et0p05_g0_mu0p01_sm0p01``).
+        """
+
+        def fmt(x: float) -> str:
+            return f"{x:g}".replace(".", "p")
+
+        return (
+            f"ep{fmt(self.epsilon)}"
+            f"_et{fmt(self.exp3_eta)}"
+            f"_g{fmt(self.exp3_gamma)}"
+            f"_mu{fmt(self.exp3_mu)}"
+            f"_sm{fmt(self.exp3_smoothness)}"
+        )
 
     @classmethod
     def from_json_file(cls, path: str | Path) -> LearningExperimentConfig:

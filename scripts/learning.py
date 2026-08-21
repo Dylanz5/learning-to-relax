@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +22,11 @@ import numpy as np
 import scipy.sparse as sp
 
 from ltr.bench.config import LearningExperimentConfig
+from ltr.bench.prob_plots import (
+    extract_action_probs,
+    plot_action_probability_heatmap,
+    plot_loss_estimate_heatmap,
+)
 from ltr.bench.similarity import similarity_spectrum
 from ltr.domains import delsq_numgrid
 from ltr.learners.exp3_spectral import Exp3Spectral
@@ -55,9 +62,9 @@ def _one_trial_worker(
     solver: str = "sor",
     L: sp.csr_matrix | None = None,
 ) -> (
-    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
+    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float, dict[str, float]]
 ):
     if trial is not None and trials is not None:
         print(f"trial {trial+1}/{trials}: starting")
@@ -87,6 +94,15 @@ def _one_trial_worker(
     learner_probs_local: dict[str, np.ndarray] = {
         name: np.zeros((T, grid.size), dtype=np.float64) for name in learners
     }
+    # Per-arm normalized cumulative loss L_i = k_i/scale for learners that expose
+    # it (Tsallis-INF). Piggybacked on the same history dict under a distinct key
+    # so it flows through the existing capture/plotting path.
+    learner_loss_est_keys: dict[str, str] = {}
+    for _name, _learner in learners.items():
+        if callable(getattr(_learner, "loss_estimates", None)):
+            _key = f"{_name}_loss_estimate"
+            learner_probs_local[_key] = np.zeros((T, grid.size), dtype=np.float64)
+            learner_loss_est_keys[_name] = _key
 
     # Reuse sparsity pattern: At = A + c I only shifts the diagonal (same as per-step eye sum).
     At = A.copy().tocsr()
@@ -129,37 +145,6 @@ def _one_trial_worker(
             diagonal=D_vec,
         ).iterations
 
-    def _extract_action_probs(learner: Any, n_arms: int) -> np.ndarray | None:
-        """Best-effort extraction of the learner's latest arm distribution."""
-        candidates = (
-            "action_probabilities",
-            "get_action_probabilities",
-            "last_action_probabilities",
-        )
-        for attr in candidates:
-            fn = getattr(learner, attr, None)
-            if callable(fn):
-                try:
-                    arr = np.asarray(fn(), dtype=float).reshape(-1)
-                except Exception:
-                    continue
-                if arr.shape == (n_arms,) and np.all(np.isfinite(arr)) and float(np.sum(arr)) > 0:
-                    arr = np.maximum(arr, 0.0)
-                    s = float(np.sum(arr))
-                    if s > 0:
-                        return arr / s
-        for attr in ("_last_p", "last_p", "p"):
-            raw = getattr(learner, attr, None)
-            if raw is None:
-                continue
-            arr = np.asarray(raw, dtype=float).reshape(-1)
-            if arr.shape == (n_arms,) and np.all(np.isfinite(arr)) and float(np.sum(arr)) > 0:
-                arr = np.maximum(arr, 0.0)
-                s = float(np.sum(arr))
-                if s > 0:
-                    return arr / s
-        return None
-
     for t in range(T):
         if trial is not None and trials is not None and (t + 1) % 100 == 0:
             print(f"trial {trial+1}/{trials}: step {t+1}/{T}")
@@ -173,15 +158,39 @@ def _one_trial_worker(
 
         for learner_name, learner in learners.items():
             action = learner.predict(rng=rng)
-            probs = _extract_action_probs(learner, grid.size)
+            probs = extract_action_probs(learner, grid.size)
             if probs is not None:
                 learner_probs_local[learner_name][t, :] = probs
+            le_key = learner_loss_est_keys.get(learner_name)
+            if le_key is not None:
+                try:
+                    l_vals = np.asarray(learner.loss_estimates(), dtype=float).reshape(-1)
+                    if l_vals.shape == (grid.size,) and np.all(np.isfinite(l_vals)):
+                        learner_probs_local[le_key][t, :] = l_vals
+                except Exception:
+                    pass
             loss = solve_iters(action, L_at, D_at)
             learner_costs_local[learner_name][t] = loss
             learner.update(loss)
 
         for i, om in enumerate(omegas):
             omega_costs_local[t, i] = solve_iters(float(om), L_at, D_at)
+
+    # Tsallis-INF diagnostics (logging only). Emitted alongside the usual
+    # per-step arrays so the driver can archive them without altering the run.
+    tinf_diag_local: dict[str, Any] = {
+        "diag": list(getattr(tinf, "diag", [])),
+        "k_hist": (
+            np.asarray(tinf.k_hist, dtype=np.float64)
+            if getattr(tinf, "k_hist", None)
+            else np.zeros((0, grid.size), dtype=np.float64)
+        ),
+        "p_hist": (
+            np.asarray(tinf.p_hist, dtype=np.float64)
+            if getattr(tinf, "p_hist", None)
+            else np.zeros((0, grid.size), dtype=np.float64)
+        ),
+    }
 
     if benchmark_solver:
         if benchmark_sor_detail:
@@ -191,11 +200,19 @@ def _one_trial_worker(
                 tinf_costs_local,
                 exp3_costs_local,
                 learner_probs_local,
+                tinf_diag_local,
                 solver_wall_s,
                 dict(sor_timings),
             )
-        return omega_costs_local, tinf_costs_local, exp3_costs_local, learner_probs_local, solver_wall_s
-    return omega_costs_local, tinf_costs_local, exp3_costs_local, learner_probs_local
+        return (
+            omega_costs_local,
+            tinf_costs_local,
+            exp3_costs_local,
+            learner_probs_local,
+            tinf_diag_local,
+            solver_wall_s,
+        )
+    return omega_costs_local, tinf_costs_local, exp3_costs_local, learner_probs_local, tinf_diag_local
 
 
 def ensure_plots_dir() -> Path:
@@ -211,36 +228,6 @@ def _print_sor_breakdown(label: str, merged: dict[str, float]) -> None:
         return
     parts = [f"{k}={merged[k]:.3f}s ({100.0 * merged[k] / total:.1f}%)" for k in sorted(merged)]
     print(f"[benchmark] {label} sor_detail sum over trials (~CPU·s): " + " | ".join(parts))
-
-
-def _plot_action_probability_heatmap(prob_matrix: np.ndarray, out_path: Path, *, title: str) -> None:
-    """Plot arm-choice probability heatmap with y=arm and x=time."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    p = np.asarray(prob_matrix, dtype=float)
-    if p.ndim != 2:
-        raise ValueError(f"expected 2D matrix (T, arms), got shape {p.shape}")
-
-    T, n_arms = p.shape
-    fig, ax = plt.subplots(figsize=(10, 5))
-    im = ax.imshow(
-        p.T,
-        origin="lower",
-        aspect="auto",
-        interpolation="nearest",
-        cmap="viridis",
-        vmin=0.0,
-        vmax=max(1e-12, float(np.max(p))),
-    )
-    ax.set_xlabel("time step", fontsize=12)
-    ax.set_ylabel("arm index", fontsize=12)
-    ax.set_title(title, fontsize=12)
-    ax.set_xlim(0, max(0, T - 1))
-    ax.set_ylim(0, max(0, n_arms - 1))
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("selection probability", fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=256)
-    plt.close(fig)
 
 
 def _run_trials(
@@ -263,9 +250,9 @@ def _run_trials(
     cfg: LearningExperimentConfig,
     L: sp.csr_matrix,
 ) -> list[
-    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
-    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
+    tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float]
+    | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float, dict[str, float]]
 ]:
     """Run all trials without subprocesses.
 
@@ -299,9 +286,9 @@ def _run_trials(
     )
 
     results: list[
-        tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]
-        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float]
-        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], float, dict[str, float]]
+        tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float]
+        | tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any], float, dict[str, float]]
     ] = [None] * trials
     if max_workers == 1:
         for trial in range(trials):
@@ -328,6 +315,67 @@ def _run_trials(
             trial = fut_to_trial[fut]
             results[trial] = fut.result()
     return results
+
+
+_DIAG_FIELDS: list[tuple[str, str]] = [
+    ("trial", "i8"),
+    ("t", "i8"),
+    ("arm", "i8"),
+    ("p_norm", "f8"),
+    ("prob_raw", "f8"),
+    ("loss", "f8"),
+    ("run_mean", "f8"),
+    ("increment", "f8"),
+    ("k_arm_before", "f8"),
+    ("k_arm_after", "f8"),
+    ("scale_before", "f8"),
+    ("scale_after", "f8"),
+    ("x", "f8"),
+    ("L_min", "f8"),
+    ("argmax_arm", "i8"),
+    ("p_max", "f8"),
+    ("entropy", "f8"),
+]
+
+
+def _build_diag_table(tinf_diags: list[dict[str, Any]]) -> np.ndarray:
+    """Flatten per-trial Tsallis-INF diag rows into one structured array.
+
+    A leading ``trial`` column disambiguates rows when ``trials > 1``.
+    """
+    dtype = np.dtype(_DIAG_FIELDS)
+    rows: list[tuple] = []
+    for trial, d in enumerate(tinf_diags):
+        if not d:
+            continue
+        for r in d.get("diag", []):
+            rows.append(tuple(trial if name == "trial" else r[name] for name, _ in _DIAG_FIELDS))
+    return np.array(rows, dtype=dtype)
+
+
+def _stack_hist(tinf_diags: list[dict[str, Any]], key: str, T: int, K: int) -> np.ndarray:
+    """Stack per-trial (T, K) history arrays into (trials, T, K)."""
+    out = np.zeros((len(tinf_diags), T, K), dtype=np.float64)
+    for trial, d in enumerate(tinf_diags):
+        if not d:
+            continue
+        arr = np.asarray(d.get(key), dtype=np.float64)
+        if arr.ndim == 2 and arr.size:
+            rows = min(T, arr.shape[0])
+            cols = min(K, arr.shape[1])
+            out[trial, :rows, :cols] = arr[:rows, :cols]
+    return out
+
+
+def _write_diag_csv(diag_table: np.ndarray, csv_path: Path) -> None:
+    """Write the scalar diag table to CSV (same stem as the run's .npz)."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    field_names = [name for name, _ in _DIAG_FIELDS]
+    with csv_path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(field_names)
+        for row in diag_table:
+            writer.writerow([row[name] for name in field_names])
 
 
 def run(
@@ -367,7 +415,7 @@ def run(
     now = datetime.datetime.now()
     prefix = cfg.plot_prefix()
     # # High-variance (disabled)
-    # filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_high_variance.png"
+    # filename = f"{prefix}{cfg.param_tag()}_{now.strftime('%Y%m%d_%H%M')}_trials{trials}_hv.png"
     # seeds = [int(rng_master.integers(0, 2**32 - 1)) for _ in range(trials)]
     # t_block = time.perf_counter()
     # solver_sum_block = 0.0
@@ -472,17 +520,19 @@ def run(
         cfg=cfg,
         L=L,
     )
+    tinf_diags: list[dict[str, Any]] = [None] * trials  # type: ignore[list-item]
     for trial, out in enumerate(out_by_trial):
         if benchmark_sor_detail:
-            oc, tc, ec, learner_probs, solver_sec, bd = out
+            oc, tc, ec, learner_probs, tinf_diag, solver_sec, bd = out
             solver_sum_block += solver_sec
             for key, val in bd.items():
                 sor_detail_sum[key] += val
         elif benchmark_solver:
-            oc, tc, ec, learner_probs, solver_sec = out
+            oc, tc, ec, learner_probs, tinf_diag, solver_sec = out
             solver_sum_block += solver_sec
         else:
-            oc, tc, ec, learner_probs = out
+            oc, tc, ec, learner_probs, tinf_diag = out
+        tinf_diags[trial] = tinf_diag
         omega_costs[:, trial, :] = oc
         tinf_costs[:, trial] = tc
         exp3_costs[:, trial] = ec
@@ -503,8 +553,37 @@ def run(
         _print_sor_breakdown("low_variance", dict(sor_detail_sum))
 
     plots = ensure_plots_dir()
-    filename = f"{prefix}{now.strftime('%Y%m%d_%H%M')}_trials{trials}_learning_low_variance.png"
+    # Timestamp first so runs sort chronologically by name.
+    filename = f"{now.strftime('%Y%m%d_%H%M')}_{prefix}{cfg.param_tag()}_trials{trials}_lv.png"
     losses_path = plots / Path(filename).with_suffix(".npz")
+
+    # Tsallis-INF diagnostics (logging only): flatten the scalar rows into a
+    # structured table and stack the per-round k/p vectors as (trials, T, K).
+    diag_table = _build_diag_table(tinf_diags)
+    tinf_k_hist = _stack_hist(tinf_diags, "k_hist", T, grid.size)
+    tinf_p_hist = _stack_hist(tinf_diags, "p_hist", T, grid.size)
+
+    # Graph artifacts for Exp3-Spectral. The graph is a *fixed* input (never
+    # updated during a run) and identical across trials: save the Laplacian, the
+    # recovered similarity matrix W (L = D - W => W = diag(diag(L)) - L), the
+    # eigenvalues, and the D-optimal exploration design q derived from the graph.
+    laplacian = np.asarray(L, dtype=np.float64)
+    similarity = np.diag(np.diag(laplacian)) - laplacian
+    eigenvalues = np.asarray(lam, dtype=np.float64)
+    exp3_exploration = np.asarray(
+        Exp3Spectral(
+            grid=grid,
+            eigenvectors=U,
+            eigenvalues=lam,
+            eta=cfg.exp3_eta,
+            gamma=cfg.exp3_gamma,
+            mu=cfg.exp3_mu,
+            smoothness=cfg.exp3_smoothness,
+            L=L,
+        ).q,
+        dtype=np.float64,
+    )
+
     np.savez_compressed(
         losses_path,
         tinf_costs=tinf_costs.astype(np.int64, copy=False),
@@ -512,6 +591,16 @@ def run(
         omega_costs=omega_costs.astype(np.int64, copy=False),
         tinf_action_probs=learner_prob_histories["tinf"].astype(np.float32, copy=False),
         exp3_action_probs=learner_prob_histories["exp3"].astype(np.float32, copy=False),
+        tinf_loss_estimates=learner_prob_histories.get(
+            "tinf_loss_estimate", np.zeros((T, trials, grid.size), dtype=np.float32)
+        ).astype(np.float32, copy=False),
+        tinf_diag=diag_table,
+        tinf_k_hist=tinf_k_hist.astype(np.float64, copy=False),
+        tinf_p_hist=tinf_p_hist.astype(np.float64, copy=False),
+        laplacian=laplacian,
+        similarity=similarity,
+        eigenvalues=eigenvalues,
+        exp3_exploration=exp3_exploration,
         omegas=np.asarray(omegas, dtype=np.float64),
         T=np.int32(T),
         trials=np.int32(trials),
@@ -524,16 +613,33 @@ def run(
         flush=True,
     )
 
-    for learner_name, probs in learner_prob_histories.items():
+    diag_csv_path = losses_path.with_suffix(".csv")
+    _write_diag_csv(diag_table, diag_csv_path)
+    print(
+        f"[experiment] saved Tsallis-INF diagnostics ({diag_table.shape[0]} rows) to {diag_csv_path!s}",
+        flush=True,
+    )
+
+    for learner_name, arr_hist in learner_prob_histories.items():
         # Aggregate across trials for a single interpretable heatmap per learner.
-        mean_probs = np.mean(probs, axis=1)
-        heatmap_path = plots / f"{Path(filename).stem}_{learner_name}_action_probs.png"
-        _plot_action_probability_heatmap(
-            mean_probs,
-            heatmap_path,
-            title=f"{learner_name}: arm selection probability over time",
-        )
-        print(f"[experiment] wrote action-probability heatmap to {heatmap_path!s}", flush=True)
+        mean_arr = np.mean(arr_hist, axis=1)
+        if learner_name.endswith("_loss_estimate"):
+            base = learner_name[: -len("_loss_estimate")]
+            heatmap_path = plots / f"{Path(filename).stem}_{base}_loss_estimates.png"
+            plot_loss_estimate_heatmap(
+                mean_arr,
+                heatmap_path,
+                title=f"{base}: per-arm normalized cumulative loss $L_i$ over time",
+            )
+            print(f"[experiment] wrote loss-estimate heatmap to {heatmap_path!s}", flush=True)
+        else:
+            heatmap_path = plots / f"{Path(filename).stem}_{learner_name}_action_probs.png"
+            plot_action_probability_heatmap(
+                mean_arr,
+                heatmap_path,
+                title=f"{learner_name}: arm selection probability over time",
+            )
+            print(f"[experiment] wrote action-probability heatmap to {heatmap_path!s}", flush=True)
 
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, om in enumerate(omegas):
@@ -543,6 +649,14 @@ def run(
     ax.set_xlabel("total solver iterations", fontsize=14)
     ax.set_ylabel("instances remaining", fontsize=14)
     ax.legend([f"$\\omega={om:.1f}$" for om in omegas] + ["Tsallis-INF", "Exp3-Spectral"], fontsize=12)
+    # Title = run filename (stem) with the leading date stripped, plus the actual
+    # Exp3-Spectral hyperparameters so a plot is self-describing.
+    title_base = re.sub(r"^\d{8}_\d{4}_", "", Path(filename).stem)
+    hp = (
+        f"$\\eta$={cfg.exp3_eta:g}  $\\gamma$={cfg.exp3_gamma:g}  "
+        f"$\\mu$={cfg.exp3_mu:g}  smooth={cfg.exp3_smoothness:g}  seed={seed}"
+    )
+    ax.set_title(f"{title_base}\n{hp}", fontsize=10)
     fig.tight_layout()
     fig.savefig(plots / filename, dpi=256)
     plt.close(fig)

@@ -74,13 +74,49 @@ def laplacian_from_edge_weights(W: np.ndarray) -> np.ndarray:
     return np.diag(d) - W
 
 
+def looks_like_laplacian(M: np.ndarray, *, tol: float = 1e-6) -> bool:
+    """Heuristic: is ``M`` already a combinatorial Laplacian (vs. edge weights)?
+
+    A combinatorial Laplacian ``L = D - W`` has zero row sums and non-positive
+    off-diagonal entries, whereas an edge-weight / adjacency matrix is
+    nonnegative with positive row sums. Either signal (zero row sums *or* any
+    negative entry) marks the input as a Laplacian. Tolerances are scaled by the
+    matrix magnitude so it works across loss/weight scales.
+    """
+    M = np.asarray(M, dtype=float)
+    if M.ndim != 2 or M.shape[0] != M.shape[1] or not np.all(np.isfinite(M)):
+        return False
+    scale = max(1.0, float(np.max(np.abs(M))))
+    atol = tol * scale
+    zero_row_sums = bool(np.allclose(M.sum(axis=1), 0.0, atol=atol))
+    off = M - np.diag(np.diag(M))
+    has_negatives = bool(np.any(off < -atol))
+    return zero_row_sums or has_negatives
+
+
+def laplacian_from_matrix(M: np.ndarray, *, is_laplacian: bool | None = None) -> np.ndarray:
+    """Return a symmetric Laplacian from ``M``.
+
+    ``is_laplacian=None`` auto-detects the format (see :func:`looks_like_laplacian`);
+    pass ``True``/``False`` to force interpreting ``M`` as a Laplacian or as
+    edge weights.
+    """
+    M = np.asarray(M, dtype=float)
+    treat_as_laplacian = looks_like_laplacian(M) if is_laplacian is None else is_laplacian
+    if treat_as_laplacian:
+        return 0.5 * (M + M.T)
+    return laplacian_from_edge_weights(M)
+
+
 def laplacian_from_bundle_arrays(data: np.lib.npyio.NpzFile) -> np.ndarray:
     if "laplacian" in data:
         L = np.asarray(data["laplacian"], dtype=float)
         return 0.5 * (L + L.T)
     for key in ("path_similarity", "adjacency", "similarity"):
         if key in data:
-            return laplacian_from_edge_weights(np.asarray(data[key], dtype=float))
+            # Named "weights" keys are usually edge weights, but tolerate a
+            # Laplacian stored under those names via auto-detection.
+            return laplacian_from_matrix(np.asarray(data[key], dtype=float))
     raise KeyError(
         "npz must contain one of: laplacian, path_similarity, adjacency, similarity",
     )
@@ -101,9 +137,9 @@ def _resolve_laplacian(
             raise ValueError(
                 f"sidecar matrix has shape {M.shape}, expected ({K}, {K}) for this loss tensor",
             )
-        if matrix_is_laplacian:
-            return 0.5 * (M + M.T)
-        return laplacian_from_edge_weights(M)
+        # ``matrix_is_laplacian`` forces Laplacian interpretation; otherwise
+        # auto-detect so any custom graph file (Laplacian or edge weights) works.
+        return laplacian_from_matrix(M, is_laplacian=True if matrix_is_laplacian else None)
     if similarity_kind is not None:
         return graph_laplacian(K, similarity_kind)
     raise ValueError(
