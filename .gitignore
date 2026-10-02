@@ -22,3 +22,6 @@ banditos/
 *.png
 
 data/
+graphs/
+plots/
+ARCHIVE.md 

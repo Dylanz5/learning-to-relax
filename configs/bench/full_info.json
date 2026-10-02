@@ -1,8 +1,0 @@
-{
-  "run_name": "fullinfo",
-  "seed": 0,
-  "exp3_eta": 0.3,
-  "exp3_gamma": 0.01,
-  "exp3_mu": 0.01,
-  "exp3_smoothness": 1.0
-}

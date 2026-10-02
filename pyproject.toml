@@ -5,7 +5,7 @@
  [project]
  name = "learning-to-relax"
  version = "0.1.0"
- description = "Python port of Learning to relax (ICLR 2024) experiments."
+ description = "Spectral bandits for choosing the SOR relaxation parameter."
  readme = "README.md"
  requires-python = ">=3.10"
  license = { file = "LICENSE" }
@@ -14,7 +14,6 @@
    "numpy>=1.26",
    "scipy>=1.11",
    "matplotlib>=3.8",
-   "joblib>=1.4",
  ]
  
  [tool.setuptools]

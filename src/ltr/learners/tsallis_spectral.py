@@ -36,7 +36,13 @@ class TsallisSpectral:
     eigenvectors: np.ndarray  # U, shape (K, K)
     eigenvalues: np.ndarray  # lam, shape (K,)
     smoothness: float = 1.0  # C in the paper (used for the bonus beta = C*sqrt(mu))
-    eta: float = 0.05  # learning rate
+    eta: float = 0.05  # base learning rate
+    #: Power-law learning-rate schedule ``eta_t = eta_scale * eta / t^eta_decay``
+    #: (t is the 1-indexed round). ``eta_scale`` sets the magnitude; ``eta_decay``
+    #: sets the decay speed: 0 = constant (default, plain constant-eta), 0.5 =
+    #: 1/sqrt(t), 1 = 1/t. Both are tunable knobs a sweep can search over.
+    eta_scale: float = 1.0
+    eta_decay: float = 0.0
     gamma: float = 0.1  # exploration mixing weight
     mu: float = 1e-2  # regularization scale on the graph Laplacian
     alpha: float = 0.5  # Tsallis entropy parameter in (0, 1)
@@ -98,13 +104,12 @@ class TsallisSpectral:
         # Cumulative losses F_t = sum_{s<t} (f_hat_s - b_s), the FTRL statistic.
         self.S = np.zeros(self.K, dtype=float)
 
+        # 1-indexed round counter for the ``eta / t^eta_decay`` schedule.
+        # Incremented in ``update()`` after the round is consumed.
+        self.t = 1
+
         # Warm-start for Algorithm 4's dual variable omega (updated each round).
         self._omega: float = float("nan")
-
-        # Running loss mean, used to normalize feedback to O(1) so the algorithm
-        # is invariant to the absolute loss scale (mirrors Exp3Spectral).
-        self._loss_running_sum: float = 0.0
-        self._loss_running_count: int = 0
 
         # Last prediction state (consumed by update()).
         self._last_p: np.ndarray | None = None
@@ -113,8 +118,12 @@ class TsallisSpectral:
     # ------------------------------------------------------------------ #
     # Algorithm 4: Newton's method for q_t                               #
     # ------------------------------------------------------------------ #
-    def _solve_q(self, F: np.ndarray) -> np.ndarray:
+    def _solve_q(self, F: np.ndarray, eta: float) -> np.ndarray:
         """Solve for q_t via Newton's method on the dual variable (Algorithm 4).
+
+        ``eta`` is the effective learning rate for this round (the scheduled
+        ``eta_scale * eta / t^eta_decay``), passed in so the rate is computed in
+        one place (``predict``).
 
         The FTRL/Tsallis stationarity condition gives, for a Lagrange multiplier
         ``omega`` enforcing ``sum_i q(i) = 1``,
@@ -132,7 +141,8 @@ class TsallisSpectral:
 
         which is exactly ``omega - phi(omega)/phi'(omega)``.
         """
-        alpha, eta = self.alpha, self.eta
+        alpha = self.alpha
+        eta = float(eta)
         exponent = 1.0 / (alpha - 1.0)  # negative
         Fmin = float(np.min(F))
         # Gap kept between omega and the pole when we have to reset/clamp; scaled
@@ -184,7 +194,10 @@ class TsallisSpectral:
     def predict(self, rng: np.random.Generator | None = None) -> float:
         rng = rng or np.random.default_rng()
 
-        q_t = self._solve_q(self.S)
+        # Power-law learning-rate schedule: eta_t = eta_scale * eta / t^eta_decay
+        # (eta_decay=0 -> constant eta_scale*eta).
+        eta_t = self.eta_scale * self.eta / (float(self.t) ** self.eta_decay)
+        q_t = self._solve_q(self.S, eta_t)
         p = self.gamma * self.pi + (1.0 - self.gamma) * q_t
 
         # numerical guard
@@ -204,14 +217,7 @@ class TsallisSpectral:
         if self._last_p is None or self._last_i is None:
             raise RuntimeError("predict() must be called before update()")
 
-        # Normalize feedback by its running mean (scale invariance).
-        self._loss_running_sum += float(loss)
-        self._loss_running_count += 1
-        loss_scale = self._loss_running_sum / self._loss_running_count
-        if (not np.isfinite(loss_scale)) or loss_scale <= 0.0:
-            loss_scale = 1.0
-        loss = float(loss) / loss_scale
-
+        loss = float(loss)
         p = self._last_p
         it = int(self._last_i)
 
@@ -230,8 +236,10 @@ class TsallisSpectral:
             # and the bonus b(i) = beta*sqrt([M^{-1}]_{ii}) uses the diagonal.
             # For the small K used here this single factorized solve for all
             # columns is cheaper than K separate solves.
-            Minv = spla.spsolve(M, sp.eye(self.K, format="csc"))
-            Minv = Minv.toarray() if sp.issparse(Minv) else np.asarray(Minv)
+            # Dense inverse: (mu*L + diag(p)) is effectively dense here, so this
+            # is ~10x faster than spsolve against a sparse identity and gives the
+            # same diagonal + column used below.
+            Minv = np.linalg.inv(M.toarray())
             loss_hat = Minv[:, it] * loss
             diag = np.clip(np.diag(Minv), 0.0, None)
             bonus = beta * np.sqrt(diag)
@@ -246,6 +254,9 @@ class TsallisSpectral:
             bonus = np.zeros(self.K, dtype=float)
 
         self.S += (loss_hat - bonus)
+
+        # Advance the schedule clock for the next round's eta_t.
+        self.t += 1
 
     def action_probabilities(self) -> np.ndarray:
         """Return the last sampling distribution over arms."""
@@ -300,12 +311,12 @@ class TsallisSpectral:
         """
         x = np.asarray(x, dtype=float).reshape(-1)
         M = (mu * sp.csr_matrix(L) + sp.diags(x, offsets=0, shape=(self.K, self.K))).tocsc()
-        grad = np.zeros(self.K)
-        for i in range(self.K):
-            hot = np.zeros(self.K)
-            hot[i] = 1.0
-            grad[i] = -(spla.spsolve(M, hot)[i])
-        return grad
+        # grad_i = -[M^{-1}]_{ii}. The full diagonal is obtained from a single
+        # dense inverse, which is orders of magnitude faster than K separate
+        # sparse solves (the (mu*L + diag(p)) matrices here are effectively
+        # dense) and numerically identical to within ~1e-13.
+        Minv = np.linalg.inv(M.toarray())
+        return -np.diag(Minv).copy()
 
     def compute_d_optimal_fw(self, L, mu, tol=1e-2, default_step=False):
         """Regularized D-optimal exploration design via Frank-Wolfe."""

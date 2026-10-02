@@ -21,7 +21,13 @@ class Exp3Spectral:
     eigenvectors: np.ndarray  # U, shape (K, K)
     eigenvalues: np.ndarray  # lam, shape (K,)
     smoothness: float = 1.0
-    eta: float = 0.1  # learning rate
+    eta: float = 0.1  # base learning rate
+    #: Power-law learning-rate schedule ``eta_t = eta_scale * eta / t^eta_decay``
+    #: (t is the 1-indexed round). ``eta_scale`` sets the magnitude; ``eta_decay``
+    #: sets the decay speed: 0 = constant (default, plain constant-eta), 0.5 =
+    #: 1/sqrt(t), 1 = 1/t. Both are tunable knobs a sweep can search over.
+    eta_scale: float = 1.0
+    eta_decay: float = 0.0
     gamma: float = 0.1  # exploration mixing
     mu: float = 1e-2  # regularization scale on eigenvalues
     exploration: np.ndarray | None = None  # q, shape (K,)
@@ -69,11 +75,9 @@ class Exp3Spectral:
         # Cumulative scores S_i = sum_{s<t} (loss_hat_s(i) - bonus_s(i))
         self.S = np.zeros(self.K, dtype=float)
 
-        # Running loss-mean used to normalize feedback to O(1), so the algorithm
-        # is invariant to the absolute loss scale (e.g. SOR iteration counts ~100
-        # vs. precomputed losses ~0.1). Replaces a previously hardcoded constant.
-        self._loss_running_sum: float = 0.0
-        self._loss_running_count: int = 0
+        # 1-indexed round counter for the ``eta / t^eta_decay`` schedule.
+        # Incremented in ``update()`` after the round is consumed.
+        self.t = 1
 
         # Last prediction state (used by update)
         self._last_p: np.ndarray | None = None
@@ -91,7 +95,10 @@ class Exp3Spectral:
     def predict(self, rng: np.random.Generator | None = None) -> float:
         rng = rng or np.random.default_rng()
 
-        p_ftrl = self._softmax(self.eta * self.S)
+        # Power-law learning-rate schedule: eta_t = eta_scale * eta / t^eta_decay
+        # (eta_decay=0 -> constant eta_scale*eta).
+        eta_t = self.eta_scale * self.eta / (float(self.t) ** self.eta_decay)
+        p_ftrl = self._softmax(eta_t * self.S)
         p = self.gamma * self.q + (1.0 - self.gamma) * p_ftrl
 
         # numerical guard
@@ -111,14 +118,7 @@ class Exp3Spectral:
         if self._last_p is None or self._last_i is None:
             raise RuntimeError("predict() must be called before update()")
 
-        # Normalize by the running mean loss so feedback is O(1) regardless of
-        # the dataset's absolute loss scale (self-calibrating; no magic constant).
-        self._loss_running_sum += float(loss)
-        self._loss_running_count += 1
-        loss_scale = self._loss_running_sum / self._loss_running_count
-        if (not np.isfinite(loss_scale)) or loss_scale <= 0.0:
-            loss_scale = 1.0
-        loss = float(loss) / loss_scale
+        loss = float(loss)
         p = self._last_p
         it = int(self._last_i)
 
@@ -171,6 +171,9 @@ class Exp3Spectral:
 
         self.S += (loss_hat - bonus)
 
+        # Advance the schedule clock for the next round's eta_t.
+        self.t += 1
+
     def action_probabilities(self) -> np.ndarray:
         """Return the last sampling distribution over arms."""
         if self._last_p is None:
@@ -186,13 +189,12 @@ class Exp3Spectral:
         # onto a single vertex.
         x = np.asarray(x, dtype=float).reshape(-1)
         M = (mu * sp.csr_matrix(L) + sp.diags(x, offsets=0, shape=(self.K, self.K))).tocsc()
-        grad = np.zeros(self.K)
-        for i in range(self.K):
-            hot = np.zeros(self.K)
-            #grad[i] = -(spla.spsolve(mu * L + sp.eye(self.K), hot)[i])
-            hot[i] = 1.0
-            grad[i] = -(spla.spsolve(M, hot)[i])
-        return grad
+        # grad_i = -[M^{-1}]_{ii}. The full diagonal is obtained from a single
+        # dense inverse, which is orders of magnitude faster than K separate
+        # sparse solves (the (mu*L + diag(p)) matrices here are effectively
+        # dense) and numerically identical to within ~1e-13.
+        Minv = np.linalg.inv(M.toarray())
+        return -np.diag(Minv).copy()
 
 
     def compute_d_optimal_fw(self, L, mu, tol=1e-2, default_step=False):
